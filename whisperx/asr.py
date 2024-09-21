@@ -67,7 +67,6 @@ class WhisperModel(faster_whisper.WhisperModel):
             res = []
             for tk in tokens:
                 res.append([token for token in tk if token < tokenizer.eot])
-            # text_tokens = [token for token in tokens if token < self.eot]
             return tokenizer.tokenizer.decode_batch(res)
 
         text = decode_batch(tokens_batch)
@@ -78,7 +77,6 @@ class WhisperModel(faster_whisper.WhisperModel):
         # When the model is running on multiple GPUs, the encoder output should be moved
         # to the CPU since we don't know which GPU will handle the next job.
         to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
-        # unsqueeze if batch size = 1
         if len(features.shape) == 2:
             features = np.expand_dims(features, 0)
         features = faster_whisper.transcribe.get_ctranslate2_storage(features)
@@ -180,7 +178,6 @@ class FasterWhisperPipeline(Pipeline):
             for seg in segments:
                 f1 = int(seg['start'] * SAMPLE_RATE)
                 f2 = int(seg['end'] * SAMPLE_RATE)
-                # print(f2-f1)
                 yield {'inputs': audio[f1:f2]}
 
         vad_segments = self.vad_model({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
@@ -215,21 +212,29 @@ class FasterWhisperPipeline(Pipeline):
         segments: List[SingleSegment] = []
         batch_size = batch_size or self._batch_size
         total_segments = len(vad_segments)
-        for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
+        
+        # Process segments in batches
+        for idx in range(0, total_segments, batch_size):
+            batch_segments = vad_segments[idx:idx+batch_size]
+            batch_audio = [audio[int(seg['start'] * SAMPLE_RATE):int(seg['end'] * SAMPLE_RATE)] for seg in batch_segments]
+            
+            batch_features = [self.preprocess({'inputs': audio})['inputs'] for audio in batch_audio]
+            batch_features = torch.stack(batch_features)
+            
+            batch_output = self._forward({'inputs': batch_features})
+            batch_text = batch_output['text']
+            
+            for i, text in enumerate(batch_text):
+                segments.append({
+                    "text": text,
+                    "start": round(batch_segments[i]['start'], 3),
+                    "end": round(batch_segments[i]['end'], 3)
+                })
+            
             if print_progress:
-                base_progress = ((idx + 1) / total_segments) * 100
+                base_progress = ((idx + len(batch_segments)) / total_segments) * 100
                 percent_complete = base_progress / 2 if combined_progress else base_progress
                 print(f"Progress: {percent_complete:.2f}%...")
-            text = out['text']
-            if batch_size in [0, 1, None]:
-                text = text[0]
-            segments.append(
-                {
-                    "text": text,
-                    "start": round(vad_segments[idx]['start'], 3),
-                    "end": round(vad_segments[idx]['end'], 3)
-                }
-            )
 
         # revert the tokenizer if multilingual inference is enabled
         if self.preset_language is None:

@@ -22,6 +22,20 @@ FRAMES_PER_SECOND = exact_div(SAMPLE_RATE, HOP_LENGTH)  # 10ms per audio frame
 TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audio token
 
 
+def normalize_audio(audio: np.ndarray) -> np.ndarray:
+    """Normalize audio to the range [-1, 1]."""
+    return audio / (np.max(np.abs(audio)) + 1e-8)
+
+def trim_silence(audio: np.ndarray, threshold: float = 0.01, frame_length: int = 2048) -> np.ndarray:
+    """Trim silence from the beginning and end of the audio."""
+    energy = np.square(audio).mean(axis=-1)
+    frames = np.array([energy[i:i+frame_length].mean() for i in range(0, len(energy), frame_length)])
+    non_silent = np.where(frames > threshold)[0]
+    if len(non_silent) > 0:
+        start, end = non_silent[0] * frame_length, (non_silent[-1] + 1) * frame_length
+        return audio[start:end]
+    return audio
+
 def load_audio(file: str, sr: int = SAMPLE_RATE):
     """
     Open an audio file and read as mono waveform, resampling as necessary
@@ -59,11 +73,12 @@ def load_audio(file: str, sr: int = SAMPLE_RATE):
             "-",
         ]
         out = subprocess.run(cmd, capture_output=True, check=True).stdout
+        audio = np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+        audio = normalize_audio(audio)
+        audio = trim_silence(audio)
+        return audio
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
-
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
-
 
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
     """
@@ -114,6 +129,7 @@ def log_mel_spectrogram(
     n_mels: int,
     padding: int = 0,
     device: Optional[Union[str, torch.device]] = None,
+    return_tensor: bool = True,
 ):
     """
     Compute the log-Mel spectrogram of
@@ -156,4 +172,20 @@ def log_mel_spectrogram(
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
+    if not return_tensor:
+        log_spec = log_spec.cpu().numpy()
     return log_spec
+
+def extract_features(audio: Union[str, np.ndarray, torch.Tensor], feature_type: str = 'mfcc', **kwargs):
+    """
+    Extract features from audio for VAD and alignment.
+    """
+    if feature_type == 'mfcc':
+        import librosa
+        if isinstance(audio, str):
+            audio = load_audio(audio)
+        return librosa.feature.mfcc(y=audio, sr=SAMPLE_RATE, **kwargs)
+    elif feature_type == 'mel':
+        return log_mel_spectrogram(audio, n_mels=80, return_tensor=False, **kwargs)
+    else:
+        raise ValueError(f"Unsupported feature type: {feature_type}")

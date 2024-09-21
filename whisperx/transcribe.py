@@ -6,12 +6,14 @@ import warnings
 import numpy as np
 import torch
 
+from .alignment import ForcedAlignment
 from .alignment import align, load_align_model
 from .asr import load_model
-from .audio import load_audio
+from .audio import load_audio, SAMPLE_RATE
 from .diarize import DiarizationPipeline, assign_word_speakers
 from .utils import (LANGUAGES, TO_LANGUAGE_CODE, get_writer, optional_float,
                     optional_int, str2bool)
+from .vad import load_vad_model, merge_chunks
 
 
 def cli():
@@ -39,9 +41,9 @@ def cli():
     parser.add_argument("--return_char_alignments", action='store_true', help="Return character-level alignments in the output json file")
 
     # vad params
-    parser.add_argument("--vad_onset", type=float, default=0.500, help="Onset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected")
-    parser.add_argument("--vad_offset", type=float, default=0.363, help="Offset threshold for VAD (see pyannote.audio), reduce this if speech is not being detected.")
-    parser.add_argument("--chunk_size", type=int, default=30, help="Chunk size for merging VAD segments. Default is 30, reduce this if the chunk is too long.")
+    parser.add_argument("--vad_onset", type=float, default=0.500, help="Onset threshold for VAD")
+    parser.add_argument("--vad_offset", type=float, default=0.363, help="Offset threshold for VAD")
+    parser.add_argument("--chunk_size", type=int, default=30, help="Chunk size for merging VAD segments")
 
     # diarization params
     parser.add_argument("--diarize", action="store_true", help="Apply diarization to assign speaker labels to each segment/word")
@@ -76,6 +78,7 @@ def cli():
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face Access Token to access PyAnnote gated models")
 
     parser.add_argument("--print_progress", type=str2bool, default = False, help = "if True, progress will be printed in transcribe() and align() methods.")
+    parser.add_argument("--forced_align_model", type=str, default="facebook/wav2vec2-base-960h", help="Name of the model to use for forced alignment")
     # fmt: on
 
     args = parser.parse_args().__dict__
@@ -163,18 +166,57 @@ def cli():
         warnings.warn("--max_line_count has no effect without --max_line_width")
     writer_args = {arg: args.pop(arg) for arg in word_options}
     
+    forced_align_model: str = args.pop("forced_align_model")
+
+    # Initialize the forced alignment model
+    aligner = ForcedAlignment(model_name=forced_align_model, device=device)
+
     # Part 1: VAD & ASR Loop
     results = []
     tmp_results = []
     # model = load_model(model_name, device=device, download_root=model_dir)
     model = load_model(model_name, device=device, device_index=device_index, download_root=model_dir, compute_type=compute_type, language=args['language'], asr_options=asr_options, vad_options={"vad_onset": vad_onset, "vad_offset": vad_offset}, task=task, threads=faster_whisper_threads)
 
+    # Load VAD model
+    vad_model = load_vad_model(device, vad_onset=vad_onset, vad_offset=vad_offset)
+
     for audio_path in args.pop("audio"):
         audio = load_audio(audio_path)
-        # >> VAD & ASR
-        print(">>Performing transcription...")
-        result = model.transcribe(audio, batch_size=batch_size, chunk_size=chunk_size, print_progress=print_progress)
-        results.append((result, audio_path))
+        
+        # Apply VAD
+        vad_segments = vad_model({'waveform': torch.from_numpy(audio).unsqueeze(0), 'sample_rate': SAMPLE_RATE})
+        
+        # Merge segments
+        merged_segments = merge_chunks(
+            vad_segments,
+            chunk_size=chunk_size,
+            onset=vad_onset,
+            offset=vad_offset
+        )
+
+        # Transcribe each merged segment
+        results = []
+        for segment in merged_segments:
+            start = segment['start']
+            end = segment['end']
+            audio_segment = audio[int(start * SAMPLE_RATE): int(end * SAMPLE_RATE)]
+            
+            result = model.transcribe(audio_segment, batch_size=batch_size)
+            
+            # Adjust timestamps
+            for seg in result['segments']:
+                seg['start'] += start
+                seg['end'] += start
+            
+            results.extend(result['segments'])
+
+        # Combine results
+        final_result = {
+            'segments': results,
+            'language': result.get('language'),
+        }
+
+        results.append((final_result, audio_path))
 
     # Unload Whisper and VAD
     del model
@@ -221,6 +263,51 @@ def cli():
             diarize_segments = diarize_model(input_audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
             result = assign_word_speakers(diarize_segments, result)
             results.append((result, input_audio_path))
+
+    # After transcription and before writing results
+    for result, audio_path in results:
+        audio = load_audio(audio_path)
+        audio_segments = []
+        transcriptions = []
+        for segment in result['segments']:
+            start_sample = int(segment['start'] * SAMPLE_RATE)
+            end_sample = int(segment['end'] * SAMPLE_RATE)
+            audio_segment = audio[start_sample:end_sample]
+            audio_segments.append(audio_segment)
+            transcriptions.append(segment['text'])
+
+        # Perform batch alignment
+        alignments = aligner.align_batch(audio_segments, transcriptions)
+
+        # Update segments with alignments and word-level timestamps
+        for segment, alignment in zip(result['segments'], alignments):
+            segment['alignment'] = alignment
+            segment['words'] = []
+            current_word = ''
+            word_start_time = None
+            for item in alignment:
+                char = item['char']
+                if char == ' ':
+                    if current_word:
+                        segment['words'].append({
+                            'word': current_word,
+                            'start_time': word_start_time,
+                            'end_time': item['start_time']
+                        })
+                        current_word = ''
+                        word_start_time = None
+                else:
+                    if not current_word:
+                        word_start_time = item['start_time']
+                    current_word += char
+            # Handle the last word
+            if current_word:
+                segment['words'].append({
+                    'word': current_word,
+                    'start_time': word_start_time,
+                    'end_time': alignment[-1]['end_time']
+                })
+
     # >> Write
     for result, audio_path in results:
         result["language"] = align_language

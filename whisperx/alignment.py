@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torchaudio
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, AutoTokenizer
 
 from .audio import SAMPLE_RATE, load_audio
 from .utils import interpolate_nans
@@ -83,6 +83,7 @@ def load_align_model(language_code, device, model_name=None, model_dir=None):
         try:
             processor = Wav2Vec2Processor.from_pretrained(model_name)
             align_model = Wav2Vec2ForCTC.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
         except Exception as e:
             print(e)
             print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned wav2vec2.0 models")
@@ -92,7 +93,7 @@ def load_align_model(language_code, device, model_name=None, model_dir=None):
         labels = processor.tokenizer.get_vocab()
         align_dictionary = {char.lower(): code for char,code in processor.tokenizer.get_vocab().items()}
 
-    align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type}
+    align_metadata = {"language": language_code, "dictionary": align_dictionary, "type": pipeline_type, "processor": processor if pipeline_type == "huggingface" else None, "tokenizer": tokenizer if pipeline_type == "huggingface" else None}
 
     return align_model, align_metadata
 
@@ -124,6 +125,8 @@ def align(
     model_dictionary = align_model_metadata["dictionary"]
     model_lang = align_model_metadata["language"]
     model_type = align_model_metadata["type"]
+    processor = align_model_metadata.get("processor")
+    tokenizer = align_model_metadata.get("tokenizer")
 
     # 1. Preprocess to keep only characters in dictionary
     total_segments = len(transcript)
@@ -206,8 +209,15 @@ def align(
             aligned_segments.append(aligned_seg)
             continue
 
-        text_clean = "".join(segment["clean_char"])
-        tokens = [model_dictionary[c] for c in text_clean]
+        if model_type == "huggingface" and tokenizer:
+            # Use the HuggingFace tokenizer for more accurate tokenization
+            tokenized = tokenizer(text, return_tensors="pt")
+            input_ids = tokenized.input_ids[0]
+            tokens = input_ids.tolist()
+        else:
+            # Fallback to character-level tokenization
+            text_clean = "".join(segment["clean_char"])
+            tokens = [model_dictionary[c] for c in text_clean]
 
         f1 = int(t1 * SAMPLE_RATE)
         f2 = int(t2 * SAMPLE_RATE)
