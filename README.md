@@ -32,7 +32,7 @@
 <!-- <h2 align="left", id="what-is-it">What is it 🔎</h2> -->
 
 
-This repository provides fast automatic speech recognition (70x realtime with large-v2) with word-level timestamps and speaker diarization.
+slightly modded - This repository provides fast automatic speech recognition (70x realtime with large-v2) with word-level timestamps and speaker diarization.
 
 - ⚡️ Batched inference for 70x realtime transcription using whisper large-v2
 - 🪶 [faster-whisper](https://github.com/guillaumekln/faster-whisper) backend, requires <8GB gpu memory for large-v2 with beam_size=5
